@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 
 from generator import PLATFORM_RULES, TONES, generate_pack
 from passphrase import WORDLIST_NAME, entropy_bits, generate_passphrases
+import jsonfix
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "credits.db")
@@ -357,6 +358,83 @@ def gen_passphrase(
             ),
             "wordlist": WORDLIST_NAME,
             "count": req.count,
+            "credits_used": 1,
+            "credits_remaining": remaining,
+        },
+        headers={"X-Credits-Remaining": str(remaining)},
+    )
+
+
+# ---------------------------------------------------------------------------
+# JSON-Fix API: POST /v1/json-fix
+# Deterministic JSON validation + repair (string surgery + json.loads only;
+# never eval/exec). 1 credit per call, shared wallet with the other endpoints.
+# Same auth / rate-limit / error-envelope patterns.
+# ---------------------------------------------------------------------------
+
+
+class JsonFixRequest(BaseModel):
+    # Field is named json_text with wire alias "json" (a literal `json`
+    # field name shadows BaseModel internals and trips a pydantic warning).
+    json_text: str = Field(alias="json", min_length=1, max_length=100000)
+    mode: str = "fix"
+    indent: int = Field(default=2, ge=0, le=8)
+
+
+@app.post("/v1/json-fix")
+def json_fix(req: JsonFixRequest, authorization: str | None = Header(default=None)):
+    row, err = _authed_key(authorization)
+    if err:
+        return err
+    err = _check_rate_limit(row["id"])
+    if err:
+        return err
+    if req.mode not in ("fix", "validate"):
+        return _err("invalid_params", "mode must be 'fix' or 'validate'.", 400)
+    if row["credits"] < 1:
+        return _err(
+            "insufficient_credits",
+            "Out of credits.",
+            402,
+            {"top_up_url": TOP_UP_URL},
+        )
+
+    valid, fixed, fixes_applied, errors = jsonfix.process(
+        req.json_text, mode=req.mode, indent=req.indent
+    )
+
+    con = _db()
+    # Atomic decrement: only succeeds if a credit is still available, so two
+    # concurrent requests can never both spend the last credit.
+    cur = con.execute(
+        "UPDATE api_keys SET credits = credits - 1 WHERE id = ? AND credits > 0",
+        (row["id"],),
+    )
+    if cur.rowcount == 0:
+        con.close()
+        return _err(
+            "out_of_credits",
+            "Out of credits.",
+            402,
+            {"top_up_url": TOP_UP_URL},
+        )
+    remaining = con.execute(
+        "SELECT credits FROM api_keys WHERE id = ?", (row["id"],)
+    ).fetchone()["credits"]
+    con.execute(
+        "INSERT INTO usage_log(key_id, endpoint, credits_used, ts) VALUES (?,?,?,?)",
+        (row["id"], "/v1/json-fix", 1, time.time()),
+    )
+    con.commit()
+    con.close()
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "valid": valid,
+            "fixed": fixed,
+            "fixes_applied": fixes_applied,
+            "errors": errors,
             "credits_used": 1,
             "credits_remaining": remaining,
         },

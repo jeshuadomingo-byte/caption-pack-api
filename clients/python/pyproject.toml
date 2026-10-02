@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "captionpack"
+name = "captionpack-api"
 version = "0.1.0"
 description = "Python client for the Caption-Pack API — social captions as a service"
 readme = "README.md"

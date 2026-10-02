@@ -1,0 +1,501 @@
+openapi: 3.1.0
+info:
+  title: Caption-Pack API
+  version: 1.0.0
+  summary: Social captions, passphrases, and JSON repair as metered micro-APIs.
+  description: |
+    POST a topic, audience and tone; get platform-ready captions + hashtags as
+    JSON. Also: memorable passphrases (EFF wordlist) and deterministic JSON
+    repair. Prepaid credits: 1 credit per metered call. A 25-call free tier
+    and a keyless playground let anyone try before they buy.
+
+    ## Key tiers
+    - **Paid keys** (`cp_live_...`): minted at `GET /v1/checkout`, 0 credits
+      until a $10 Stripe payment credits 500. 60 req/min.
+    - **Free keys** (`cp_free_...`): minted at `GET /v1/free-trial`, 25 credits
+      on a shared wallet across all three metered endpoints. 10 req/min,
+      expire after 7 days, can never be topped up or converted to paid.
+
+    ## Credit model
+    Every metered endpoint costs exactly 1 credit per call. Credits are
+    decremented atomically (concurrent requests cannot double-spend the last
+    credit). Balances are readable at `GET /v1/balance`.
+
+    ## Rate limits
+    - Paid keys: 60 requests/minute per key.
+    - Free keys: 10 requests/minute per key.
+    - `GET /v1/checkout`: 20 mints/hour per IP.
+    - `GET /v1/free-trial`: 1 key per IP per 24 hours.
+    - `POST /v1/playground`: 5 calls/hour per IP, no key required.
+    All 429s use the error envelope below.
+
+    ## Error envelope
+    Every 4xx/5xx is `{"error": {"code": "...", "message": "..."}}`.
+    402s add `top_up_url`. Known codes: `invalid_params` (400),
+    `invalid_key` (401), `key_expired` (401), `insufficient_credits` (402),
+    `out_of_credits` (402), `free_trial_exhausted` (402),
+    `free_trial_limit` (429), `rate_limited` (429),
+    `free_key_not_top_uppable` (400), `invalid_signature` (400),
+    `webhook_not_configured` (503), `stats_not_configured` (503),
+    `invalid_operator_token` (401).
+  contact:
+    name: Caption-Pack API support
+    email: Jeshua.domingo@gmail.com
+  x-schema-freeze:
+    version: "2026-10-02"
+    frozen_until: "2026-11-02"
+    policy: >
+      Request/response JSON shapes are frozen until 2026-11-02. No breaking
+      changes without the operator's explicit approval. Additive, optional
+      fields may appear; required fields and error codes will not change.
+servers:
+  - url: https://caption-pack-api.onrender.com
+    description: Production (Render Free)
+  - url: http://localhost:8471
+    description: Local dev (`uvicorn app:app --port 8471`)
+security:
+  - bearerAuth: []
+paths:
+  /v1/caption-pack:
+    post:
+      summary: Generate a caption pack
+      description: 1 credit per call. Deterministic template engine (+ a
+        proven 30-pack corpus for cybersecurity topics).
+      operationId: captionPack
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PackRequest'
+      responses:
+        '200':
+          description: Caption pack + credit accounting.
+          headers:
+            X-Credits-Remaining:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/CaptionPack'
+                  - type: object
+                    required: [credits_used, credits_remaining]
+                    properties:
+                      credits_used: { type: integer, example: 1 }
+                      credits_remaining: { type: integer, example: 499 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/passphrase:
+    post:
+      summary: Generate memorable passphrases
+      description: |
+        1 credit per call (shared wallet with caption-pack). Words drawn from
+        the EFF short wordlist #2 with the `secrets` module (CSPRNG) only.
+        Free-tier keys draw from the same 25-credit wallet — no separate
+        passphrase allowance, one budget across all endpoints.
+      operationId: genPassphrase
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PassphraseRequest'
+      responses:
+        '200':
+          description: Passphrases + entropy math + credit accounting.
+          headers:
+            X-Credits-Remaining:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [passphrases, entropy_bits, wordlist, count,
+                           credits_used, credits_remaining]
+                properties:
+                  passphrases: { type: array, items: { type: string },
+                                 example: ["cable-comet-dingo-bliss",
+                                           "flute-ivory-orbit-quilt"] }
+                  entropy_bits: { type: number, example: 41.4 }
+                  wordlist: { type: string, example: "EFF short wordlist #2" }
+                  count: { type: integer, example: 5 }
+                  credits_used: { type: integer, example: 1 }
+                  credits_remaining: { type: integer, example: 499 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/json-fix:
+    post:
+      summary: Validate and repair JSON
+      description: |
+        1 credit per call (shared wallet). Deterministic repair — string
+        surgery + `json.loads` only, never eval/exec. Free-tier keys draw from
+        the same 25-credit wallet as caption-pack and passphrase.
+      operationId: jsonFix
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JsonFixRequest'
+      responses:
+        '200':
+          description: Validation result + repaired JSON + credit accounting.
+          headers:
+            X-Credits-Remaining:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [valid, fixed, fixes_applied, errors,
+                           credits_used, credits_remaining]
+                properties:
+                  valid: { type: boolean, description: "Input parsed as-is." }
+                  fixed: { type: [string, "null"],
+                           description: "Repaired pretty-printed JSON, or null when unfixable." }
+                  fixes_applied: { type: array, items: { type: string },
+                                   description: "Repair strategies that fired, in order." }
+                  errors: { type: array, items: { type: string },
+                            description: "Parse errors; populated when valid is false." }
+                  credits_used: { type: integer, example: 1 }
+                  credits_remaining: { type: integer, example: 499 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/balance:
+    get:
+      summary: Check credit balance
+      description: Free call. Returns tier and expiry for free-tier keys.
+      operationId: balance
+      responses:
+        '200':
+          description: Current wallet state.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [credits, key_id, tier]
+                properties:
+                  credits: { type: integer, example: 499 }
+                  key_id: { type: integer, example: 42 }
+                  tier: { type: string, enum: [paid, free], example: paid }
+                  expires_at: { type: [number, "null"],
+                                description: "Unix timestamp; null for paid keys (never expire)." }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/checkout:
+    get:
+      summary: Mint a paid key and start Stripe checkout
+      description: |
+        Mints a fresh 0-credit paid key (`cp_live_...`, shown once) and renders
+        an HTML page with a button into the $10 Stripe Payment Link. The key's
+        id travels as `?client_reference_id=` so the webhook credits exactly
+        this key. Throttled: 20 mints/hour per IP.
+      operationId: checkout
+      responses:
+        '200':
+          description: HTML page with the new key + payment button.
+          content:
+            text/html:
+              schema: { type: string }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/free-trial:
+    get:
+      summary: Mint a 25-call free-tier key
+      description: |
+        No payment, no signup. Mints a `cp_free_...` key with 25 credits on a
+        wallet shared across /v1/caption-pack, /v1/passphrase and /v1/json-fix.
+        Anti-abuse: max 1 key per IP per 24h (throttle keys on the
+        edge-appended X-Forwarded-For IP and the raw peer IP, so header
+        spoofing alone cannot farm keys); keys expire after 7 days; 10 req/min
+        (vs 60 paid); free keys can never be topped up or converted — the
+        Stripe webhook refuses free key ids. An optional
+        `X-Device-Fingerprint` header is logged as a second abuse signal.
+      operationId: freeTrial
+      parameters:
+        - in: header
+          name: X-Device-Fingerprint
+          required: false
+          schema: { type: string, maxLength: 128 }
+          description: Best-effort device/browser fingerprint; logged for abuse
+            review, never blocks on its own.
+      responses:
+        '200':
+          description: The free key (shown once) + its terms.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [api_key, key_id, tier, credits, calls_remaining,
+                           expires_at, rate_limit_per_min, endpoints, message]
+                properties:
+                  api_key: { type: string, example: "cp_free_9f2c…" }
+                  key_id: { type: integer }
+                  tier: { type: string, example: "free" }
+                  credits: { type: integer, example: 25 }
+                  calls_remaining: { type: integer, example: 25 }
+                  expires_at: { type: number, description: "Unix timestamp, 7 days after mint." }
+                  rate_limit_per_min: { type: integer, example: 10 }
+                  endpoints:
+                    type: array
+                    items: { type: string }
+                    example: ["/v1/caption-pack", "/v1/passphrase", "/v1/json-fix"]
+                  message: { type: string }
+        '429': { $ref: '#/components/responses/FreeTrialLimited' }
+  /v1/playground:
+    post:
+      summary: Keyless caption playground
+      description: |
+        Try-before-you-key: real caption JSON with no API key. Throttled to
+        5 calls/hour per IP to bound scraping. The keyed 25-call free tier
+        (`GET /v1/free-trial`) is the builder/integration surface; the
+        playground is the conversion surface.
+      operationId: playground
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PackRequest'
+      responses:
+        '200':
+          description: Caption pack (no credit fields) flagged as playground output.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/CaptionPack'
+                  - type: object
+                    required: [playground]
+                    properties:
+                      playground: { type: boolean, example: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/stats:
+    get:
+      summary: Operator usage metrics
+      description: |
+        Keys created by tier, calls per key/endpoint/day, unique IPs per day,
+        caller User-Agents (truncated to 200 chars, to detect AI-agent
+        traffic), playground usage, and free→paid conversion (IPs that minted
+        a free key and later had a checkout key credited by Stripe).
+        Protected by `Authorization: Bearer <OPERATOR_TOKEN>`. 503 when
+        OPERATOR_TOKEN is not configured.
+      operationId: operatorStats
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: Aggregated metrics.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  schema_freeze_version: { type: string, example: "2026-10-02" }
+                  keys_created:
+                    type: object
+                    additionalProperties: { type: integer }
+                    example: { paid: 12, free: 148 }
+                  calls_total: { type: integer }
+                  calls_by_endpoint:
+                    type: object
+                    additionalProperties: { type: integer }
+                  calls_by_key:
+                    type: object
+                    additionalProperties: { type: integer }
+                  calls_by_day:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        day: { type: string, example: "2026-10-02" }
+                        calls: { type: integer }
+                        unique_ips: { type: integer }
+                  top_user_agents:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        user_agent: { type: string }
+                        calls: { type: integer }
+                  playground:
+                    type: object
+                    properties:
+                      calls_total: { type: integer }
+                      unique_ips_total: { type: integer }
+                      calls_24h: { type: integer }
+                      unique_ips_24h: { type: integer }
+                  free_tier:
+                    type: object
+                    properties:
+                      mints_24h: { type: integer }
+                  free_to_paid_conversion:
+                    type: object
+                    properties:
+                      converted_ips: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503':
+          description: OPERATOR_TOKEN not configured on the server.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+  /v1/stripe-webhook:
+    post:
+      summary: Stripe payment webhook (server-to-server)
+      description: |
+        Verifies Stripe's HMAC-SHA256 signature, then credits the key named by
+        `client_reference_id` (idempotent via the Stripe event id). Refuses
+        free-tier key ids with `free_key_not_top_uppable` — free keys can never
+        be topped up or converted to paid.
+      operationId: stripeWebhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Raw Stripe event JSON (signature-verified).
+      responses:
+        '200':
+          description: Event received (and credited, or noted as duplicate).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received: { type: boolean }
+                  duplicate: { type: boolean }
+                  credits_added: { type: integer }
+                  key_id: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '503':
+          description: STRIPE_WEBHOOK_SECRET not configured on the server.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+  /openapi.yaml:
+    get:
+      summary: This specification file
+      description: Serves openapi.yaml so agents and tooling can fetch the
+        machine-readable contract straight from the API root.
+      operationId: openapiSpec
+      security: []
+      responses:
+        '200':
+          description: The OpenAPI 3.1 specification.
+          content:
+            application/yaml:
+              schema: { type: string }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: API key (`cp_live_...` paid or `cp_free_...` free trial).
+    operatorToken:
+      type: http
+      scheme: bearer
+      description: OPERATOR_TOKEN env var value; protects GET /v1/stats.
+  schemas:
+    PackRequest:
+      type: object
+      required: [topic, audience]
+      properties:
+        topic: { type: string, minLength: 1, maxLength: 200,
+                 example: "morning routines" }
+        audience: { type: string, minLength: 1, maxLength: 200,
+                    example: "busy parents" }
+        tone: { type: string, enum: [warm, bold, professional, playful],
+                default: warm }
+        platform: { type: string,
+                    enum: [instagram, linkedin, x, tiktok],
+                    default: instagram }
+        count: { type: integer, minimum: 1, maximum: 10, default: 5 }
+        include_hashtags: { type: boolean, default: true }
+        niche: { type: ["string", "null"],
+                 description: "Optional niche hint (e.g. cybersecurity unlocks the proven corpus)." }
+    Caption:
+      type: object
+      required: [id, hook, body, cta]
+      properties:
+        id: { type: integer, example: 1 }
+        hook: { type: string }
+        body: { type: string }
+        cta: { type: string }
+        hashtags: { type: array, items: { type: string } }
+    CaptionPack:
+      type: object
+      required: [pack_id, topic, audience, tone, platform, source, captions]
+      properties:
+        pack_id: { type: string, example: "pack_9f2c1a4b" }
+        topic: { type: string }
+        audience: { type: string }
+        tone: { type: string }
+        platform: { type: string }
+        source: { type: string,
+                  example: "template-engine:v1",
+                  description: "'proven-corpus:cybersecurity-30-pack' for cybersecurity topics." }
+        captions:
+          type: array
+          items: { $ref: '#/components/schemas/Caption' }
+    PassphraseRequest:
+      type: object
+      properties:
+        words: { type: integer, minimum: 3, maximum: 8, default: 4 }
+        separator: { type: string, maxLength: 8, default: "-" }
+        capitalize: { type: boolean, default: false }
+        digit: { type: boolean, default: false }
+        symbol: { type: boolean, default: false }
+        count: { type: integer, minimum: 1, maximum: 20, default: 5 }
+    JsonFixRequest:
+      type: object
+      required: [json]
+      properties:
+        json: { type: string, minLength: 1, maxLength: 100000,
+                description: "The JSON document to validate/repair." }
+        mode: { type: string, enum: [fix, validate], default: fix }
+        indent: { type: integer, minimum: 0, maximum: 8, default: 2 }
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: "invalid_key" }
+            message: { type: string }
+            top_up_url: { type: string,
+                          description: "Present on 402s: the Stripe payment link." }
+  responses:
+    BadRequest:
+      description: Invalid parameters.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Unauthorized:
+      description: Missing/invalid API key (or operator token / expired key).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    PaymentRequired:
+      description: Out of credits. Envelope includes top_up_url.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    RateLimited:
+      description: Rate limit exceeded — slow down and retry.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    FreeTrialLimited:
+      description: One free trial key per IP per 24 hours.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }

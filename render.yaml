@@ -1,0 +1,16 @@
+# Render Blueprint for the Caption-Pack API (free tier).
+# Deploy: Render dashboard -> New -> Blueprint -> connect the repo containing
+# this file. Then set STRIPE_WEBHOOK_SECRET in the dashboard (from Stripe:
+# Developers -> Webhooks -> Add endpoint -> https://<this-service>/v1/stripe-webhook).
+services:
+  - type: web
+    name: caption-pack-api
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn app:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false # set in the Render dashboard after first deploy
+      - key: STRIPE_TOP_UP_URL
+        value: "https://buy.stripe.com/cNicN46gF08nctC9FEbsc00"

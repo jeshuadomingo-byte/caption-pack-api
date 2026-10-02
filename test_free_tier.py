@@ -43,6 +43,7 @@ def fresh_db():
     app.DB_PATH = tmp.name
     app._hits.clear()
     app._checkout_hits.clear()
+    app._public_stats_hits.clear()
     app.init_db()
     return tmp.name
 
@@ -297,7 +298,32 @@ def main() -> None:
     con.close()
     check("UA truncated to 200 chars", all(len(u) <= 200 for u in uas_db))
 
-    # --- 11. openapi.yaml served -----------------------------------------------
+    # --- 12. public aggregate stats: no auth, counts only ----------------------
+    app._public_stats_hits.clear()
+    ps = app.public_stats(make_req(ip="10.0.0.50"))
+    check("public-stats 200 without auth", status_of(ps) == 200)
+    psd = resp_json(ps)
+    check("public-stats keys exact",
+          set(psd.keys()) == {"schema_freeze_version", "window",
+                               "free_keys_minted_24h", "unique_visitors_24h",
+                               "metered_calls_24h", "playground_calls_24h"})
+    check("window is last_24h", psd["window"] == "last_24h")
+    check("free keys counted", psd["free_keys_minted_24h"] >= 3)
+    check("visitors counted", psd["unique_visitors_24h"] >= 3)
+    check("metered calls counted", psd["metered_calls_24h"] >= 20)
+    check("playground calls counted", psd["playground_calls_24h"] >= 6)
+    check("no per-visitor detail leaks",
+          not any(k in psd for k in ("ip", "ips", "key", "user_agent")))
+    # throttle: 60/hour per IP, other IPs unaffected
+    app._public_stats_hits.clear()
+    codes = [status_of(app.public_stats(make_req(ip="10.0.0.51")))
+             for _ in range(61)]
+    check("61st public-stats call in hour -> 429",
+          codes[-1] == 429 and all(c == 200 for c in codes[:-1]))
+    check("different IP unaffected",
+          status_of(app.public_stats(make_req(ip="10.0.0.52"))) == 200)
+
+    # --- 13. openapi.yaml served -----------------------------------------------
     spec_resp = app.openapi_spec()
     check("openapi.yaml served", status_of(spec_resp) == 200)
     check("spec mentions free-trial",

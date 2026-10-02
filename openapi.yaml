@@ -345,6 +345,30 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+  /v1/public-stats:
+    get:
+      summary: Public aggregate usage stats
+      description: |
+        Aggregate counts for the last 24 hours — no auth required. Returns
+        counts ONLY (free keys minted, unique visitors, metered calls,
+        playground calls). No IPs, keys, user agents, or any per-visitor
+        detail ever leaves this endpoint. Throttled to 60 requests/hour per IP.
+      operationId: publicStats
+      responses:
+        '200':
+          description: Aggregate counts for the last 24 hours.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  schema_freeze_version: { type: string, example: "2026-10-02" }
+                  window: { type: string, example: "last_24h" }
+                  free_keys_minted_24h: { type: integer, example: 148 }
+                  unique_visitors_24h: { type: integer, example: 96 }
+                  metered_calls_24h: { type: integer, example: 1204 }
+                  playground_calls_24h: { type: integer, example: 37 }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /v1/stripe-webhook:
     post:
       summary: Stripe payment webhook (server-to-server)

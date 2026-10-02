@@ -981,6 +981,61 @@ def stats(authorization: str | None = Header(default=None)):
 
 
 # ---------------------------------------------------------------------------
+# Public aggregate stats: GET /v1/public-stats
+# No auth. Aggregate counts ONLY — no IPs, keys, user agents, or any
+# per-visitor detail ever leaves this endpoint. Lets anyone (including the
+# owner) answer "is anyone using this?" at a glance. Light per-IP throttle
+# (60/hour, same in-memory pattern as /v1/checkout).
+# ---------------------------------------------------------------------------
+
+_public_stats_hits: dict[str, list[float]] = {}
+PUBLIC_STATS_PER_HOUR = 60
+
+
+@app.get("/v1/public-stats")
+def public_stats(request: Request):
+    ip = _client_ip(request)
+    now = time.time()
+    window = [t for t in _public_stats_hits.get(ip, []) if now - t < 3600]
+    if len(window) >= PUBLIC_STATS_PER_HOUR:
+        return _err(
+            "rate_limited",
+            "Slow down — 60 requests/hour per IP on /v1/public-stats.",
+            429,
+        )
+    window.append(now)
+    _public_stats_hits[ip] = window
+
+    con = _db()
+    cutoff = now - 86400
+    free_keys_24h = con.execute(
+        "SELECT COUNT(*) AS n FROM free_trial_mints WHERE ts > ?", (cutoff,)
+    ).fetchone()["n"]
+    unique_visitors_24h = con.execute(
+        "SELECT COUNT(*) AS n FROM ("
+        " SELECT ip FROM free_trial_mints WHERE ts > ?"
+        " UNION SELECT ip FROM playground_log WHERE ts > ?"
+        " UNION SELECT ip FROM usage_log WHERE ts > ?)",
+        (cutoff, cutoff, cutoff),
+    ).fetchone()["n"]
+    metered_calls_24h = con.execute(
+        "SELECT COUNT(*) AS n FROM usage_log WHERE ts > ?", (cutoff,)
+    ).fetchone()["n"]
+    playground_calls_24h = con.execute(
+        "SELECT COUNT(*) AS n FROM playground_log WHERE ts > ?", (cutoff,)
+    ).fetchone()["n"]
+    con.close()
+    return {
+        "schema_freeze_version": SCHEMA_FREEZE_VERSION,
+        "window": "last_24h",
+        "free_keys_minted_24h": free_keys_24h,
+        "unique_visitors_24h": unique_visitors_24h,
+        "metered_calls_24h": metered_calls_24h,
+        "playground_calls_24h": playground_calls_24h,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Machine-readable API contract: GET /openapi.yaml
 # The frozen schema (v2026-10-02, frozen until 2026-11-02) lives in
 # openapi.yaml next to this file; served here so agents and tooling can

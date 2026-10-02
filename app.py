@@ -19,8 +19,9 @@ import hmac
 import json
 import os
 import secrets
-import sqlite3
 import time
+
+import libsql_experimental as libsql
 
 from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
@@ -46,10 +47,65 @@ app = FastAPI(
 )
 
 
-def _db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+TURSO_URL_ENV = "TURSO_DATABASE_URL"
+TURSO_TOKEN_ENV = "TURSO_AUTH_TOKEN"
+
+
+class _DictCursor:
+    """Wraps a libsql cursor so rows behave like sqlite3.Row (name access).
+
+    libsql returns plain tuples; the app reads row["credits"] etc., so we
+    map columns via cursor.description. rowcount/lastrowid pass through.
+    """
+
+    def __init__(self, cur):
+        self._cur = cur
+        self.rowcount = cur.rowcount
+        self.lastrowid = cur.lastrowid
+
+    def _cols(self):
+        desc = self._cur.description
+        return [d[0] for d in desc] if desc else []
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        return dict(zip(self._cols(), row)) if row is not None else None
+
+    def fetchall(self):
+        cols = self._cols()
+        return [dict(zip(cols, r)) for r in self._cur.fetchall()]
+
+
+class _Connection:
+    """Thin wrapper: dict-like rows + commit/close, whatever the backend."""
+
+    def __init__(self, con):
+        self._con = con
+
+    def execute(self, sql, params=()):
+        return _DictCursor(self._con.execute(sql, params))
+
+    def commit(self):
+        return self._con.commit()
+
+    def close(self):
+        return self._con.close()
+
+
+def _db() -> "_Connection":
+    """Single DB helper for the whole app.
+
+    Turso cloud when TURSO_DATABASE_URL + TURSO_AUTH_TOKEN are set,
+    otherwise the local embedded SQLite file (zero-config dev/tests).
+    The rest of the code never cares which backend is live.
+    """
+    url = os.environ.get(TURSO_URL_ENV, "").strip()
+    token = os.environ.get(TURSO_TOKEN_ENV, "").strip()
+    if url and token:
+        con = libsql.connect(url, auth_token=token)
+    else:
+        con = libsql.connect("file:" + DB_PATH)
+    return _Connection(con)
 
 
 def init_db() -> None:

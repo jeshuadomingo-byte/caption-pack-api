@@ -5,7 +5,7 @@ Turn a topic, audience, and tone into ready-to-post social captions + hashtags, 
 ## Install
 
 ```bash
-pip install captionpack
+pip install captionpack-api
 ```
 
 (Get your API key at the [Caption-Pack site](https://muse.ai/s/caption-pack-api-xfxt62ya0xcxlxhh) — $10 for 500 calls.)

@@ -1,0 +1,30 @@
+# Caption-Pack API
+
+Caption-Pack is a prepaid API that generates ready-to-post social media captions
+with hashtags as JSON. Built for developers and AI agents building social media
+tooling. Deterministic engine (no LLM in the loop).
+
+- Landing page: https://muse.ai/s/caption-pack-api-xfxt62ya0xcxlxhh
+- API base URL: https://caption-pack-api.onrender.com
+- OpenAPI spec: https://github.com/jeshuadomingo-byte/caption-pack-api (openapi.yaml, publishing Oct 2 2026)
+
+## Endpoints
+
+- POST /v1/caption-pack — Generate captions. Body: {"topic", "audience", "tone",
+  "platform", "count", "include_hashtags"}. Auth: Bearer API key. 1 credit per call.
+- GET /v1/balance — Check remaining credits. Auth: Bearer API key.
+- GET /v1/checkout — Mint an API key and start Stripe checkout ($10 for 500 calls).
+- GET /v1/free-trial — Mint a free-tier key (25 calls, no card). Live Oct 2 2026.
+
+## Pricing
+
+$10 for 500 prepaid calls (2 cents per call) via Stripe. 25-call free tier, no
+credit card required. Key auth (cp_live_... / cp_free_...), 60 requests/minute
+per paid key. All sales final; terms on the landing page.
+
+## Example
+
+POST /v1/caption-pack
+{"topic": "password managers", "audience": "small business owners",
+ "tone": "warm", "platform": "linkedin", "count": 5}
+-> {"captions": [{"hook", "body", "cta"}], "hashtags": [...]}

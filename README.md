@@ -86,6 +86,34 @@ From then on, every completed $10 checkout auto-credits the buyer's key.
 No human involvement. Run the regression anytime:
 `.venv/bin/python test_webhook.py`
 
+## Database: local file vs Turso cloud
+
+The app talks to SQLite through the `libsql` client, via one helper (`_db()`
+in `app.py`). Two modes, same SQL:
+
+- **Local mode (default):** no env vars set → embedded SQLite file
+  `credits.db` next to the app. Zero config — this is what local dev and all
+  tests use.
+- **Turso mode:** set both env vars → the app connects to Turso cloud instead:
+  - `TURSO_DATABASE_URL` — e.g. `libsql://your-db.turso.io`
+  - `TURSO_AUTH_TOKEN` — the database auth token
+  - Both must be set; if either is missing the app falls back to the local file.
+
+**Why:** Render Free's filesystem is ephemeral — `credits.db` can vanish on
+redeploy/restart, taking keys and credit balances with it. Turso keeps the
+data in managed cloud storage so deploys and sleep/wake cycles can't lose it.
+
+**Jeshua's layup (5 minutes, free):**
+1. Create a free database at https://turso.tech (sign up, `turso db create
+   caption-pack`, then `turso db show --url` and `turso db tokens create`).
+   The tables are created automatically by the app on first connect
+   (`init_db()` runs at startup; same schema as local).
+2. In Render → caption-pack-api → Environment, add `TURSO_DATABASE_URL` and
+   `TURSO_AUTH_TOKEN` with those two values, then save (triggers a redeploy).
+3. Verify: the service log should show a clean startup; `GET /v1/checkout`
+   still returns 200. Existing keys/credits in the old local file do NOT
+   transfer automatically — migrate or re-issue them before switching.
+
 ## Security notes
 
 - Only sha256 hashes of keys touch the database; raw keys are shown once.

@@ -14,3 +14,5 @@ services:
         sync: false # set in the Render dashboard after first deploy
       - key: STRIPE_TOP_UP_URL
         value: "https://buy.stripe.com/cNicN46gF08nctC9FEbsc00"
+      - key: OPERATOR_TOKEN
+        sync: false # Jeshua's layup: any random secret; protects GET /v1/stats

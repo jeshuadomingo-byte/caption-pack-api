@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "captionpack"
+version = "0.1.0"
+description = "Python client for the Caption-Pack API — social captions as a service"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Jeshua Domingo" }]
+dependencies = ["requests>=2.28"]
+keywords = ["captions", "social-media", "api-client", "ai-agents"]
+
+[project.urls]
+Homepage = "https://muse.ai/s/caption-pack-api-xfxt62ya0xcxlxhh"
+Repository = "https://github.com/jeshuadomingo-byte/caption-pack-api"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["captionpack*"]

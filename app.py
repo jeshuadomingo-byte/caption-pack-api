@@ -34,10 +34,25 @@ import jsonfix
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "credits.db")
-RATE_LIMIT_PER_MIN = 60
+RATE_LIMIT_PER_MIN = 60  # paid tier
+FREE_TIER_PER_MIN = 10  # free tier: harsher, so farmed keys are slow
 # Real Stripe payment link goes here (Jeshua's layup); env override wins.
 TOP_UP_URL = os.environ.get("STRIPE_TOP_UP_URL", "https://buy.stripe.com/cNicN46gF08nctC9FEbsc00")
 STRIPE_WEBHOOK_SECRET_ENV = "STRIPE_WEBHOOK_SECRET"
+OPERATOR_TOKEN_ENV = "OPERATOR_TOKEN"
+
+# --- Free tier (25-call trial) -------------------------------------------
+FREE_KEY_PREFIX = "cp_free_"
+FREE_TIER_CREDITS = 25
+FREE_TIER_EXPIRY_DAYS = 7
+FREE_MINTS_PER_IP_PER_DAY = 1  # one free key per IP per 24h
+PLAYGROUND_PER_HOUR_PER_IP = 5  # keyless playground throttle
+
+# --- Schema freeze ---------------------------------------------------------
+# Request/response JSON shapes are frozen as of this build for 30 days.
+# No breaking changes without Jeshua's explicit approval.
+SCHEMA_FREEZE_VERSION = "2026-10-02"
+SCHEMA_FREEZE_UNTIL = "2026-11-02"
 
 _hits: dict[int, list[float]] = {}
 
@@ -136,8 +151,47 @@ def init_db() -> None:
                credits_added INTEGER NOT NULL DEFAULT 0,
                ts REAL NOT NULL)"""
     )
+    # --- Free-tier / metrics tables (added 2026-10-02) --------------------
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS free_trial_mints(
+               id INTEGER PRIMARY KEY,
+               ip TEXT NOT NULL,
+               peer_ip TEXT,
+               xff TEXT,
+               fingerprint TEXT,
+               key_id INTEGER,
+               ts REAL NOT NULL)"""
+    )
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS checkout_mints(
+               id INTEGER PRIMARY KEY,
+               ip TEXT NOT NULL,
+               key_id INTEGER,
+               ts REAL NOT NULL)"""
+    )
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS playground_log(
+               id INTEGER PRIMARY KEY,
+               ip TEXT NOT NULL,
+               user_agent TEXT,
+               ts REAL NOT NULL)"""
+    )
+    # Migrate existing databases: api_keys gains tier + expires_at,
+    # usage_log gains ip + user_agent for the metrics endpoint.
+    _ensure_column(con, "api_keys", "tier", "TEXT NOT NULL DEFAULT 'paid'")
+    _ensure_column(con, "api_keys", "expires_at", "REAL")
+    _ensure_column(con, "usage_log", "ip", "TEXT")
+    _ensure_column(con, "usage_log", "user_agent", "TEXT")
     con.commit()
     con.close()
+
+
+def _ensure_column(con, table: str, column: str, ddl: str) -> None:
+    """ALTER TABLE ADD COLUMN if missing — lets existing DBs (local file or
+    Turso) pick up new columns on next boot without a manual migration."""
+    cols = [r["name"] for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in cols:
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 init_db()
@@ -173,17 +227,102 @@ def _authed_key(authorization: str | None):
     con.close()
     if not row or row["revoked"]:
         return None, _err("invalid_key", "API key is missing or invalid.", 401)
+    if row.get("expires_at") and row["expires_at"] < time.time():
+        return None, _err("key_expired", "This API key has expired.", 401)
     return row, None
 
 
-def _check_rate_limit(key_id: int):
+def _check_rate_limit(key_id: int, per_min: int = RATE_LIMIT_PER_MIN):
     now = time.time()
     window = [t for t in _hits.get(key_id, []) if now - t < 60]
-    if len(window) >= RATE_LIMIT_PER_MIN:
-        return _err("rate_limited", "Slow down \u2014 60 requests/minute per key.", 429)
+    if len(window) >= per_min:
+        return _err(
+            "rate_limited",
+            f"Slow down \u2014 {per_min} requests/minute per key.",
+            429,
+        )
     window.append(now)
     _hits[key_id] = window
     return None
+
+
+def _tier_rate_limit(row) -> int:
+    """Free-tier keys are throttled harder (10/min) than paid keys (60/min)."""
+    return FREE_TIER_PER_MIN if row.get("tier") == "free" else RATE_LIMIT_PER_MIN
+
+
+def _client_ip(request) -> str:
+    """Best-effort client IP for throttles and abuse review.
+
+    Behind Render's edge proxy the TCP peer is the load balancer, so we
+    trust the RIGHTMOST X-Forwarded-For entry — the one our own edge
+    appended, which a caller cannot spoof past. With no XFF header (local
+    dev, tests) we fall back to the direct peer IP.
+    """
+    xff = ""
+    try:
+        xff = request.headers.get("x-forwarded-for", "") if request else ""
+    except Exception:
+        xff = ""
+    parts = [p.strip() for p in xff.split(",") if p.strip()]
+    if parts:
+        return parts[-1]
+    client = getattr(request, "client", None) if request else None
+    return client.host if client and getattr(client, "host", None) else "unknown"
+
+
+def _truncated_ua(request, limit: int = 200) -> str | None:
+    try:
+        ua = request.headers.get("user-agent", "") if request else ""
+    except Exception:
+        ua = ""
+    ua = (ua or "").strip()[:limit]
+    return ua or None
+
+
+def _credit_check(row):
+    """Pre-generation 402 when the wallet is empty (tier-aware message)."""
+    if row["credits"] < 1:
+        if row.get("tier") == "free":
+            return _err(
+                "free_trial_exhausted",
+                "Free trial credits exhausted \u2014 $10 gets 500 calls on a paid key.",
+                402,
+                {"top_up_url": TOP_UP_URL},
+            )
+        return _err(
+            "insufficient_credits",
+            "Out of credits.",
+            402,
+            {"top_up_url": TOP_UP_URL},
+        )
+    return None
+
+
+def _spend_credit(row, endpoint: str, ip: str | None, user_agent: str | None):
+    """Atomically decrement 1 credit and log the call (with IP + UA for the
+    metrics endpoint). Returns (credits_remaining, error_response)."""
+    con = _db()
+    # Atomic decrement: only succeeds if a credit is still available, so two
+    # concurrent requests can never both spend the last credit.
+    cur = con.execute(
+        "UPDATE api_keys SET credits = credits - 1 WHERE id = ? AND credits > 0",
+        (row["id"],),
+    )
+    if cur.rowcount == 0:
+        con.close()
+        return None, _credit_check({"credits": 0, "tier": row.get("tier")})
+    remaining = con.execute(
+        "SELECT credits FROM api_keys WHERE id = ?", (row["id"],)
+    ).fetchone()["credits"]
+    con.execute(
+        "INSERT INTO usage_log(key_id, endpoint, credits_used, ts, ip, user_agent)"
+        " VALUES (?,?,?,?,?,?)",
+        (row["id"], endpoint, 1, time.time(), ip, user_agent),
+    )
+    con.commit()
+    con.close()
+    return remaining, None
 
 
 class PackRequest(BaseModel):
@@ -197,11 +336,15 @@ class PackRequest(BaseModel):
 
 
 @app.post("/v1/caption-pack")
-def caption_pack(req: PackRequest, authorization: str | None = Header(default=None)):
+def caption_pack(
+    req: PackRequest,
+    authorization: str | None = Header(default=None),
+    request: Request = None,
+):
     row, err = _authed_key(authorization)
     if err:
         return err
-    err = _check_rate_limit(row["id"])
+    err = _check_rate_limit(row["id"], _tier_rate_limit(row))
     if err:
         return err
 
@@ -213,13 +356,9 @@ def caption_pack(req: PackRequest, authorization: str | None = Header(default=No
             f"platform must be one of {', '.join(PLATFORM_RULES)}.",
             400,
         )
-    if row["credits"] < 1:
-        return _err(
-            "insufficient_credits",
-            "Out of credits.",
-            402,
-            {"top_up_url": TOP_UP_URL},
-        )
+    err = _credit_check(row)
+    if err:
+        return err
 
     try:
         pack = generate_pack(
@@ -234,31 +373,11 @@ def caption_pack(req: PackRequest, authorization: str | None = Header(default=No
     except ValueError as exc:
         return _err("invalid_params", str(exc), 400)
 
-    remaining = row["credits"] - 1
-    con = _db()
-    # Atomic decrement: only succeeds if a credit is still available, so two
-    # concurrent requests can never both spend the last credit.
-    cur = con.execute(
-        "UPDATE api_keys SET credits = credits - 1 WHERE id = ? AND credits > 0",
-        (row["id"],),
+    remaining, err = _spend_credit(
+        row, "/v1/caption-pack", _client_ip(request), _truncated_ua(request)
     )
-    if cur.rowcount == 0:
-        con.close()
-        return _err(
-            "out_of_credits",
-            "Out of credits.",
-            402,
-            {"top_up_url": TOP_UP_URL},
-        )
-    remaining = con.execute(
-        "SELECT credits FROM api_keys WHERE id = ?", (row["id"],)
-    ).fetchone()["credits"]
-    con.execute(
-        "INSERT INTO usage_log(key_id, endpoint, credits_used, ts) VALUES (?,?,?,?)",
-        (row["id"], "/v1/caption-pack", 1, time.time()),
-    )
-    con.commit()
-    con.close()
+    if err:
+        return err
 
     pack["credits_used"] = 1
     pack["credits_remaining"] = remaining
@@ -274,7 +393,12 @@ def balance(authorization: str | None = Header(default=None)):
     row, err = _authed_key(authorization)
     if err:
         return err
-    return {"credits": row["credits"], "key_id": row["id"]}
+    return {
+        "credits": row["credits"],
+        "key_id": row["id"],
+        "tier": row.get("tier") or "paid",
+        "expires_at": row.get("expires_at"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -296,21 +420,19 @@ class PassphraseRequest(BaseModel):
 
 @app.post("/v1/passphrase")
 def gen_passphrase(
-    req: PassphraseRequest, authorization: str | None = Header(default=None)
+    req: PassphraseRequest,
+    authorization: str | None = Header(default=None),
+    request: Request = None,
 ):
     row, err = _authed_key(authorization)
     if err:
         return err
-    err = _check_rate_limit(row["id"])
+    err = _check_rate_limit(row["id"], _tier_rate_limit(row))
     if err:
         return err
-    if row["credits"] < 1:
-        return _err(
-            "insufficient_credits",
-            "Out of credits.",
-            402,
-            {"top_up_url": TOP_UP_URL},
-        )
+    err = _credit_check(row)
+    if err:
+        return err
 
     try:
         phrases = generate_passphrases(
@@ -324,30 +446,11 @@ def gen_passphrase(
     except ValueError as exc:
         return _err("invalid_params", str(exc), 400)
 
-    con = _db()
-    # Atomic decrement: only succeeds if a credit is still available, so two
-    # concurrent requests can never both spend the last credit.
-    cur = con.execute(
-        "UPDATE api_keys SET credits = credits - 1 WHERE id = ? AND credits > 0",
-        (row["id"],),
+    remaining, err = _spend_credit(
+        row, "/v1/passphrase", _client_ip(request), _truncated_ua(request)
     )
-    if cur.rowcount == 0:
-        con.close()
-        return _err(
-            "out_of_credits",
-            "Out of credits.",
-            402,
-            {"top_up_url": TOP_UP_URL},
-        )
-    remaining = con.execute(
-        "SELECT credits FROM api_keys WHERE id = ?", (row["id"],)
-    ).fetchone()["credits"]
-    con.execute(
-        "INSERT INTO usage_log(key_id, endpoint, credits_used, ts) VALUES (?,?,?,?)",
-        (row["id"], "/v1/passphrase", 1, time.time()),
-    )
-    con.commit()
-    con.close()
+    if err:
+        return err
 
     return JSONResponse(
         status_code=200,
@@ -382,51 +485,32 @@ class JsonFixRequest(BaseModel):
 
 
 @app.post("/v1/json-fix")
-def json_fix(req: JsonFixRequest, authorization: str | None = Header(default=None)):
+def json_fix(
+    req: JsonFixRequest,
+    authorization: str | None = Header(default=None),
+    request: Request = None,
+):
     row, err = _authed_key(authorization)
     if err:
         return err
-    err = _check_rate_limit(row["id"])
+    err = _check_rate_limit(row["id"], _tier_rate_limit(row))
     if err:
         return err
     if req.mode not in ("fix", "validate"):
         return _err("invalid_params", "mode must be 'fix' or 'validate'.", 400)
-    if row["credits"] < 1:
-        return _err(
-            "insufficient_credits",
-            "Out of credits.",
-            402,
-            {"top_up_url": TOP_UP_URL},
-        )
+    err = _credit_check(row)
+    if err:
+        return err
 
     valid, fixed, fixes_applied, errors = jsonfix.process(
         req.json_text, mode=req.mode, indent=req.indent
     )
 
-    con = _db()
-    # Atomic decrement: only succeeds if a credit is still available, so two
-    # concurrent requests can never both spend the last credit.
-    cur = con.execute(
-        "UPDATE api_keys SET credits = credits - 1 WHERE id = ? AND credits > 0",
-        (row["id"],),
+    remaining, err = _spend_credit(
+        row, "/v1/json-fix", _client_ip(request), _truncated_ua(request)
     )
-    if cur.rowcount == 0:
-        con.close()
-        return _err(
-            "out_of_credits",
-            "Out of credits.",
-            402,
-            {"top_up_url": TOP_UP_URL},
-        )
-    remaining = con.execute(
-        "SELECT credits FROM api_keys WHERE id = ?", (row["id"],)
-    ).fetchone()["credits"]
-    con.execute(
-        "INSERT INTO usage_log(key_id, endpoint, credits_used, ts) VALUES (?,?,?,?)",
-        (row["id"], "/v1/json-fix", 1, time.time()),
-    )
-    con.commit()
-    con.close()
+    if err:
+        return err
 
     return JSONResponse(
         status_code=200,
@@ -474,6 +558,12 @@ def checkout(request: Request):
         (hash_key(raw_key), 0, time.time()),
     )
     key_id = cur.lastrowid
+    # Log the mint IP: lets /v1/stats measure free→paid conversion
+    # (an IP that minted a free trial key and later bought credits).
+    con.execute(
+        "INSERT INTO checkout_mints(ip, key_id, ts) VALUES (?,?,?)",
+        (_client_ip(request), key_id, time.time()),
+    )
     con.commit()
     con.close()
 
@@ -597,6 +687,21 @@ async def stripe_webhook(request: Request):
                 "client_reference_id did not match an active API key.",
                 400,
             )
+        if row.get("tier") == "free":
+            # Free-trial keys can NEVER be topped up or converted to paid.
+            # Record the attempt for the abuse review, credit nothing.
+            con.execute(
+                "UPDATE stripe_events SET key_id = ? WHERE event_id = ?",
+                (key_id, event_id),
+            )
+            con.commit()
+            con.close()
+            return _err(
+                "free_key_not_top_uppable",
+                "Free-trial keys cannot be topped up. Mint a paid key at"
+                " GET /v1/checkout and pay there.",
+                400,
+            )
         try:
             credits_added = int((session.get("metadata") or {}).get("credits", 500))
         except (TypeError, ValueError):
@@ -614,3 +719,279 @@ async def stripe_webhook(request: Request):
     con.commit()
     con.close()
     return {"received": True, "credits_added": credits_added, "key_id": key_id}
+
+
+# ---------------------------------------------------------------------------
+# Free trial: GET /v1/free-trial
+# Mints a 25-call free-tier key. Exploitation-resistant by design:
+#   - max 1 free key per IP per 24h (DB-tracked, survives restarts)
+#   - the throttle keys on the edge-appended X-Forwarded-For IP (unspoofable
+#     past our proxy) AND the raw TCP peer IP, so header spoofing alone
+#     cannot farm keys
+#   - free keys are visibly marked (cp_free_...) with a tier flag in the DB
+#   - harsher rate limit (10/min vs 60/min paid), 7-day expiry (they rot)
+#   - free keys can NEVER be topped up (webhook refuses) or converted;
+#     buying credits mints a separate paid key via /v1/checkout
+#   - optional X-Device-Fingerprint header is logged as a second abuse
+#     signal (never blocks on its own)
+# Economics: 25 calls ~= $0.50 of value; a fresh residential IP costs more
+# than that, so farming is uneconomical.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/v1/free-trial")
+def free_trial(request: Request):
+    ip = _client_ip(request)
+    peer_ip = request.client.host if request.client else None
+    try:
+        xff = request.headers.get("x-forwarded-for", "") or ""
+    except Exception:
+        xff = ""
+    try:
+        fingerprint = (request.headers.get("x-device-fingerprint", "") or "")[:128]
+    except Exception:
+        fingerprint = ""
+    now = time.time()
+    cutoff = now - 86400
+
+    con = _db()
+    mints = con.execute(
+        "SELECT COUNT(*) AS n FROM free_trial_mints WHERE ip = ? AND ts > ?",
+        (ip, cutoff),
+    ).fetchone()["n"]
+    if peer_ip and peer_ip != ip:
+        # Same TCP peer minting under different XFF values: still one device.
+        peer_mints = con.execute(
+            "SELECT COUNT(*) AS n FROM free_trial_mints"
+            " WHERE peer_ip = ? AND ts > ?",
+            (peer_ip, cutoff),
+        ).fetchone()["n"]
+        mints = max(mints, peer_mints)
+    if mints >= FREE_MINTS_PER_IP_PER_DAY:
+        con.close()
+        return _err(
+            "free_trial_limit",
+            "One free trial key per IP per 24 hours.",
+            429,
+        )
+
+    raw_key = FREE_KEY_PREFIX + secrets.token_hex(16)
+    expires_at = now + FREE_TIER_EXPIRY_DAYS * 86400
+    cur = con.execute(
+        "INSERT INTO api_keys(key_hash, credits, created_at, revoked, tier,"
+        " expires_at) VALUES (?,?,?,0,'free',?)",
+        (hash_key(raw_key), FREE_TIER_CREDITS, now, expires_at),
+    )
+    key_id = cur.lastrowid
+    con.execute(
+        "INSERT INTO free_trial_mints(ip, peer_ip, xff, fingerprint, key_id, ts)"
+        " VALUES (?,?,?,?,?,?)",
+        (ip, peer_ip, xff[:500], fingerprint or None, key_id, now),
+    )
+    con.commit()
+    con.close()
+
+    return {
+        "api_key": raw_key,  # shown once — store it now
+        "key_id": key_id,
+        "tier": "free",
+        "credits": FREE_TIER_CREDITS,
+        "calls_remaining": FREE_TIER_CREDITS,
+        "expires_at": expires_at,
+        "rate_limit_per_min": FREE_TIER_PER_MIN,
+        "endpoints": ["/v1/caption-pack", "/v1/passphrase", "/v1/json-fix"],
+        "message": (
+            "25 free API calls across caption-pack, passphrase and json-fix"
+            " (shared wallet, 1 credit per call). No card required. The key"
+            " expires in 7 days, is throttled to 10 req/min, and can never be"
+            " topped up \u2014 buying $10 of credits mints a separate paid key"
+            " at GET /v1/checkout."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Keyless playground: POST /v1/playground
+# Try-before-you-key: real caption JSON with no API key. Tight per-IP
+# throttle (5/hour) bounds scraping; the keyed 25-call free tier at
+# GET /v1/free-trial is the builder/integration surface.
+# ---------------------------------------------------------------------------
+
+
+@app.post("/v1/playground")
+def playground(req: PackRequest, request: Request):
+    ip = _client_ip(request)
+    ua = _truncated_ua(request)
+    now = time.time()
+
+    con = _db()
+    used = con.execute(
+        "SELECT COUNT(*) AS n FROM playground_log WHERE ip = ? AND ts > ?",
+        (ip, now - 3600),
+    ).fetchone()["n"]
+    if used >= PLAYGROUND_PER_HOUR_PER_IP:
+        con.close()
+        return _err(
+            "rate_limited",
+            "Playground limit is 5 calls/hour per IP \u2014 mint a free API key"
+            " at GET /v1/free-trial for 25 calls.",
+            429,
+        )
+
+    if req.tone not in TONES:
+        con.close()
+        return _err("invalid_params", f"tone must be one of {', '.join(TONES)}.", 400)
+    if req.platform not in PLATFORM_RULES:
+        con.close()
+        return _err(
+            "invalid_params",
+            f"platform must be one of {', '.join(PLATFORM_RULES)}.",
+            400,
+        )
+    try:
+        pack = generate_pack(
+            topic=req.topic,
+            audience=req.audience,
+            tone=req.tone,
+            platform=req.platform,
+            count=req.count,
+            include_hashtags=req.include_hashtags,
+            niche=req.niche,
+        )
+    except ValueError as exc:
+        con.close()
+        return _err("invalid_params", str(exc), 400)
+
+    con.execute(
+        "INSERT INTO playground_log(ip, user_agent, ts) VALUES (?,?,?)",
+        (ip, ua, now),
+    )
+    con.commit()
+    con.close()
+
+    pack["playground"] = True
+    return JSONResponse(status_code=200, content=pack)
+
+
+# ---------------------------------------------------------------------------
+# Operator stats: GET /v1/stats
+# Lightweight usage metrics (keys created by tier, calls per key/endpoint/day,
+# unique IPs per day, caller User-Agents, free->paid conversion). Protected by
+# a shared operator token: Authorization: Bearer <OPERATOR_TOKEN>.
+# 503 when OPERATOR_TOKEN is not configured (same pattern as the webhook).
+# ---------------------------------------------------------------------------
+
+
+@app.get("/v1/stats")
+def stats(authorization: str | None = Header(default=None)):
+    token = os.environ.get(OPERATOR_TOKEN_ENV, "")
+    if not token:
+        return _err(
+            "stats_not_configured",
+            "Operator stats are not configured on this server.",
+            503,
+        )
+    presented = (
+        authorization[len("Bearer "):].strip()
+        if authorization and authorization.startswith("Bearer ")
+        else ""
+    )
+    if not presented or not hmac.compare_digest(presented, token):
+        return _err("invalid_operator_token", "Operator token is missing or invalid.", 401)
+
+    con = _db()
+    keys = con.execute(
+        "SELECT tier, COUNT(*) AS n FROM api_keys GROUP BY tier"
+    ).fetchall()
+    keys_created = {r["tier"] or "paid": r["n"] for r in keys}
+
+    calls_by_endpoint = {
+        r["endpoint"]: r["n"]
+        for r in con.execute(
+            "SELECT endpoint, COUNT(*) AS n FROM usage_log GROUP BY endpoint"
+        ).fetchall()
+    }
+    calls_total = sum(calls_by_endpoint.values())
+
+    calls_by_key = {
+        r["key_id"]: r["n"]
+        for r in con.execute(
+            "SELECT key_id, COUNT(*) AS n FROM usage_log GROUP BY key_id"
+        ).fetchall()
+    }
+
+    by_day = con.execute(
+        "SELECT date(ts, 'unixepoch') AS day, COUNT(*) AS calls,"
+        " COUNT(DISTINCT ip) AS unique_ips FROM usage_log"
+        " GROUP BY day ORDER BY day DESC LIMIT 14"
+    ).fetchall()
+    calls_by_day = [
+        {"day": r["day"], "calls": r["calls"], "unique_ips": r["unique_ips"]}
+        for r in by_day
+    ]
+
+    top_ua = con.execute(
+        "SELECT user_agent, COUNT(*) AS n FROM usage_log"
+        " WHERE user_agent IS NOT NULL GROUP BY user_agent"
+        " ORDER BY n DESC LIMIT 10"
+    ).fetchall()
+    top_user_agents = [
+        {"user_agent": r["user_agent"], "calls": r["n"]} for r in top_ua
+    ]
+
+    pg = con.execute(
+        "SELECT COUNT(*) AS calls, COUNT(DISTINCT ip) AS ips FROM playground_log"
+    ).fetchone()
+    pg_24h = con.execute(
+        "SELECT COUNT(*) AS calls, COUNT(DISTINCT ip) AS ips FROM playground_log"
+        " WHERE ts > ?",
+        (time.time() - 86400,),
+    ).fetchone()
+
+    free_mints_24h = con.execute(
+        "SELECT COUNT(*) AS n FROM free_trial_mints WHERE ts > ?",
+        (time.time() - 86400,),
+    ).fetchone()["n"]
+    # Free->paid conversion: IPs that minted a free trial key AND later had a
+    # checkout key actually credited by Stripe.
+    converted = con.execute(
+        "SELECT COUNT(DISTINCT f.ip) AS n FROM free_trial_mints f"
+        " JOIN checkout_mints c ON c.ip = f.ip"
+        " JOIN stripe_events s ON s.key_id = c.key_id AND s.credits_added > 0"
+    ).fetchone()["n"]
+
+    con.close()
+    return {
+        "schema_freeze_version": SCHEMA_FREEZE_VERSION,
+        "keys_created": keys_created,
+        "calls_total": calls_total,
+        "calls_by_endpoint": calls_by_endpoint,
+        "calls_by_key": calls_by_key,
+        "calls_by_day": calls_by_day,
+        "top_user_agents": top_user_agents,
+        "playground": {
+            "calls_total": pg["calls"],
+            "unique_ips_total": pg["ips"],
+            "calls_24h": pg_24h["calls"],
+            "unique_ips_24h": pg_24h["ips"],
+        },
+        "free_tier": {"mints_24h": free_mints_24h},
+        "free_to_paid_conversion": {"converted_ips": converted},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Machine-readable API contract: GET /openapi.yaml
+# The frozen schema (v2026-10-02, frozen until 2026-11-02) lives in
+# openapi.yaml next to this file; served here so agents and tooling can
+# fetch it straight from the API root.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/openapi.yaml")
+def openapi_spec():
+    from fastapi.responses import FileResponse
+
+    return FileResponse(
+        os.path.join(BASE_DIR, "openapi.yaml"), media_type="application/yaml"
+    )

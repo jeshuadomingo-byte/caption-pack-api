@@ -28,6 +28,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from generator import PLATFORM_RULES, TONES, generate_pack
+from passphrase import WORDLIST_NAME, entropy_bits, generate_passphrases
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "credits.db")
@@ -217,6 +218,94 @@ def balance(authorization: str | None = Header(default=None)):
     if err:
         return err
     return {"credits": row["credits"], "key_id": row["id"]}
+
+
+# ---------------------------------------------------------------------------
+# Passphrase API: POST /v1/passphrase
+# Memorable, policy-compliant passphrases from the EFF short wordlist #2,
+# drawn with the `secrets` module (CSPRNG) only. 1 credit per call, shared
+# wallet with caption-pack. Same auth / rate-limit / error-envelope patterns.
+# ---------------------------------------------------------------------------
+
+
+class PassphraseRequest(BaseModel):
+    words: int = Field(default=4, ge=3, le=8)
+    separator: str = Field(default="-", max_length=8)
+    capitalize: bool = False
+    digit: bool = False
+    symbol: bool = False
+    count: int = Field(default=5, ge=1, le=20)
+
+
+@app.post("/v1/passphrase")
+def gen_passphrase(
+    req: PassphraseRequest, authorization: str | None = Header(default=None)
+):
+    row, err = _authed_key(authorization)
+    if err:
+        return err
+    err = _check_rate_limit(row["id"])
+    if err:
+        return err
+    if row["credits"] < 1:
+        return _err(
+            "insufficient_credits",
+            "Out of credits.",
+            402,
+            {"top_up_url": TOP_UP_URL},
+        )
+
+    try:
+        phrases = generate_passphrases(
+            words=req.words,
+            separator=req.separator,
+            capitalize=req.capitalize,
+            digit=req.digit,
+            symbol=req.symbol,
+            count=req.count,
+        )
+    except ValueError as exc:
+        return _err("invalid_params", str(exc), 400)
+
+    con = _db()
+    # Atomic decrement: only succeeds if a credit is still available, so two
+    # concurrent requests can never both spend the last credit.
+    cur = con.execute(
+        "UPDATE api_keys SET credits = credits - 1 WHERE id = ? AND credits > 0",
+        (row["id"],),
+    )
+    if cur.rowcount == 0:
+        con.close()
+        return _err(
+            "out_of_credits",
+            "Out of credits.",
+            402,
+            {"top_up_url": TOP_UP_URL},
+        )
+    remaining = con.execute(
+        "SELECT credits FROM api_keys WHERE id = ?", (row["id"],)
+    ).fetchone()["credits"]
+    con.execute(
+        "INSERT INTO usage_log(key_id, endpoint, credits_used, ts) VALUES (?,?,?,?)",
+        (row["id"], "/v1/passphrase", 1, time.time()),
+    )
+    con.commit()
+    con.close()
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "passphrases": phrases,
+            "entropy_bits": entropy_bits(
+                req.words, digit=req.digit, symbol=req.symbol
+            ),
+            "wordlist": WORDLIST_NAME,
+            "count": req.count,
+            "credits_used": 1,
+            "credits_remaining": remaining,
+        },
+        headers={"X-Credits-Remaining": str(remaining)},
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -62,6 +62,22 @@ app = FastAPI(
     description="POST a topic, audience and tone; get platform-ready captions + hashtags as JSON. 1 credit per call.",
 )
 
+# CORS for the public, unauthenticated GET endpoints only (not a schema
+# change — HTTP-level headers). Lets the landing page fetch live public
+# stats cross-origin. Deliberately scoped: /v1/free-trial is excluded so
+# third-party pages can't mint keys from visitors' browsers.
+_PUBLIC_CORS_PATHS = {"/v1/public-stats", "/openapi.yaml", "/openapi.json"}
+
+
+@app.middleware("http")
+async def _public_cors(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path in _PUBLIC_CORS_PATHS:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response.headers["Access-Control-Max-Age"] = "86400"
+    return response
+
 
 TURSO_URL_ENV = "TURSO_DATABASE_URL"
 TURSO_TOKEN_ENV = "TURSO_AUTH_TOKEN"

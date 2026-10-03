@@ -38,6 +38,11 @@ RATE_LIMIT_PER_MIN = 60  # paid tier
 FREE_TIER_PER_MIN = 10  # free tier: harsher, so farmed keys are slow
 # Real Stripe payment link goes here (Jeshua's layup); env override wins.
 TOP_UP_URL = os.environ.get("STRIPE_TOP_UP_URL", "https://buy.stripe.com/cNicN46gF08nctC9FEbsc00")
+# Pro tier payment link ($25 / 1,500 credits). Hardcoded default keeps the tier
+# live without a Render dashboard change; env override wins if set. The
+# webhook needs no change: it already credits session.metadata["credits"]
+# (default 500), and the Pro link carries metadata credits=1500.
+TOP_UP_URL_PRO = os.environ.get("STRIPE_TOP_UP_URL_PRO", "https://buy.stripe.com/bJe00i7kJdZd0KUg42bsc01")
 STRIPE_WEBHOOK_SECRET_ENV = "STRIPE_WEBHOOK_SECRET"
 OPERATOR_TOKEN_ENV = "OPERATOR_TOKEN"
 
@@ -583,8 +588,17 @@ def checkout(request: Request):
     con.commit()
     con.close()
 
-    sep = "&" if "?" in TOP_UP_URL else "?"
-    pay_url = f"{TOP_UP_URL}{sep}client_reference_id={key_id}"
+    def _pay_url(base: str) -> str:
+        sep = "&" if "?" in base else "?"
+        return f"{base}{sep}client_reference_id={key_id}"
+
+    pay_url = _pay_url(TOP_UP_URL)
+    pro_block = ""
+    if TOP_UP_URL_PRO:
+        pro_block = f"""
+<p style="margin-top:28px">Need more? <b>Pro pack</b> \u2014 1,500 credits for $25
+(1.7&cent; per call).</p>
+<a class="btn" href="{_pay_url(TOP_UP_URL_PRO)}">Continue to payment \u2014 $25 for 1,500 credits</a>"""
     return HTMLResponse(
         f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
@@ -603,9 +617,10 @@ padding:14px 32px;border-radius:10px;font-weight:600;margin-top:8px}}
 </style></head><body><div class="card">
 <h1>Your API key is ready</h1>
 <p>Save this now — it's shown <b>once</b>. After payment, this same key gets
-500 credits automatically.</p>
+credited automatically.</p>
 <div class="key">{raw_key}</div>
 <a class="btn" href="{pay_url}">Continue to payment — $10 for 500 credits</a>
+{pro_block}
 <p class="warn">No refunds — all sales final. Credits never expire.</p>
 </div></body></html>"""
     )

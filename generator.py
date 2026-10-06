@@ -298,9 +298,18 @@ def generate_pack(topic: str, audience: str, tone: str = "warm",
             captions.append(cap)
         source = "proven-corpus:cybersecurity-30-pack"
     else:
+        # Per-request dedup: redraw on (hook, body, cta) collision so a pack
+        # never ships two identical captions. Bounded retries keep this
+        # deterministic (seeded rng) and loop-safe when a pool is exhausted.
+        seen: set[tuple[str, str, str]] = set()
         for i in range(count):
-            cap = _generic_caption(topic, audience, tone, platform,
-                                   include_hashtags, rng)
+            for _ in range(50):
+                cap = _generic_caption(topic, audience, tone, platform,
+                                       include_hashtags, rng)
+                sig = (cap["hook"], cap["body"], cap["cta"])
+                if sig not in seen:
+                    seen.add(sig)
+                    break
             cap["id"] = i + 1
             captions.append(cap)
         source = "template-engine:v1"

@@ -904,6 +904,58 @@ def playground(req: PackRequest, request: Request):
     return JSONResponse(status_code=200, content=pack)
 
 
+@app.get("/v1/playground")
+def playground_page():
+    return HTMLResponse(
+        """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caption-Pack playground</title>
+<style>
+body{background:#0b0f19;color:#e8ecf4;font-family:system-ui,sans-serif;display:flex;justify-content:center;padding:48px 16px;margin:0}
+.card{max-width:560px;width:100%;background:#131a2b;border:1px solid #243049;border-radius:16px;padding:32px}
+label{display:block;font-size:13px;margin:14px 0 4px;color:#9fb0cc}
+input,select{width:100%;box-sizing:border-box;background:#0b0f19;color:#e8ecf4;border:1px solid #243049;border-radius:8px;padding:10px;font-size:14px}
+button{background:#3b82f6;color:#fff;border:none;padding:12px 28px;border-radius:10px;font-weight:600;margin-top:18px;cursor:pointer}
+pre{background:#0b0f19;border:1px solid #243049;border-radius:8px;padding:14px;overflow:auto;font-size:12px;margin-top:18px;white-space:pre-wrap}
+.note{color:#9fb0cc;font-size:13px;margin-top:14px}
+</style></head><body><div class="card">
+<h1>Caption-Pack playground</h1>
+<p class="note">Keyless try — 5 calls per hour per IP. For more, mint a free key (25 calls): <a href="/v1/free-trial">/v1/free-trial</a>.</p>
+<form id="f">
+<label>Topic</label><input name="topic" value="password managers" required>
+<label>Audience</label><input name="audience" value="small business owners" required>
+<label>Tone</label><select name="tone"><option>warm</option><option>bold</option><option>professional</option><option>playful</option></select>
+<label>Platform</label><select name="platform"><option>linkedin</option><option>instagram</option><option>tiktok</option><option>x</option></select>
+<label>Count</label><input name="count" type="number" value="5" min="1" max="10">
+<button type="submit">Generate captions</button>
+</form>
+<pre id="out">Your captions will appear here.</pre>
+<script>
+document.getElementById('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const d = new FormData(e.target);
+  const body = {
+    topic: d.get('topic'), audience: d.get('audience'), tone: d.get('tone'),
+    platform: d.get('platform'), count: parseInt(d.get('count'), 10)
+  };
+  const out = document.getElementById('out');
+  out.textContent = 'Working…';
+  try {
+    const r = await fetch('/v1/playground', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    const j = await r.json();
+    out.textContent = JSON.stringify(j, null, 2);
+  } catch (err) { out.textContent = 'Error: ' + err.message; }
+});
+</script></div></body></html>"""
+    )
+
+
+
+
 # ---------------------------------------------------------------------------
 # Operator stats: GET /v1/stats
 # Lightweight usage metrics (keys created by tier, calls per key/endpoint/day,

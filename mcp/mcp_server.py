@@ -221,7 +221,16 @@ if __name__ == "__main__":
         import uvicorn
         from starlette.middleware.cors import CORSMiddleware
 
-        _app = server.streamable_http_app(stateless_http=True)
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        # Public HTTPS server: DNS-rebinding host checks would reject the
+        # public hostname, so disable them (CORS is already open by design).
+        _app = server.streamable_http_app(
+            stateless_http=True,
+            transport_security=TransportSecuritySettings(
+                enable_dns_rebinding_protection=False
+            ),
+        )
 
         from starlette.responses import JSONResponse
         from starlette.routing import Route

@@ -38,6 +38,13 @@ RATE_LIMIT_PER_MIN = 60  # paid tier
 FREE_TIER_PER_MIN = 10  # free tier: harsher, so farmed keys are slow
 # Real Stripe payment link goes here (Jeshua's layup); env override wins.
 TOP_UP_URL = os.environ.get("STRIPE_TOP_UP_URL", "https://buy.stripe.com/cNicN46gF08nctC9FEbsc00")
+# Buyer checkout page: mints a paid key and links Stripe with
+# ?client_reference_id=<key_id> so the webhook credits the right key.
+# Surfaced in 402 bodies — the raw STRIPE_TOP_UP_URL can't credit anyone,
+# so it must never appear in error responses.
+CHECKOUT_URL = os.environ.get(
+    "CHECKOUT_URL", "https://caption-pack-api.onrender.com/v1/checkout"
+)
 # Pro tier payment link ($25 / 1,500 credits). Hardcoded default keeps the tier
 # live without a Render dashboard change; env override wins if set. The
 # webhook needs no change: it already credits session.metadata["credits"]
@@ -302,22 +309,39 @@ def _truncated_ua(request, limit: int = 200) -> str | None:
 
 
 def _credit_check(row):
-    """Pre-generation 402 when the wallet is empty (tier-aware message)."""
+    """Pre-generation 402 when the wallet is empty (tier-aware message).
+
+    The 402 body carries checkout_url (the /v1/checkout page), never the raw
+    Stripe link \u2014 only /v1/checkout mints a key whose client_reference_id
+    lets the webhook credit the payment.
+    """
     if row["credits"] < 1:
         if row.get("tier") == "free":
             return _err(
                 "free_trial_exhausted",
                 "Free trial credits exhausted \u2014 $10 gets 500 calls on a paid key.",
                 402,
-                {"top_up_url": TOP_UP_URL},
+                {"checkout_url": CHECKOUT_URL},
             )
         return _err(
             "insufficient_credits",
-            "Out of credits.",
+            "Out of credits \u2014 $10 gets 500 calls.",
             402,
-            {"top_up_url": TOP_UP_URL},
+            {"checkout_url": CHECKOUT_URL},
         )
     return None
+
+
+def _trial_ending_extras(row, remaining):
+    """Soft upgrade nudge for free-trial keys running low (<=3 credits).
+
+    Returns (body_extra, header_extra): a `trial_ending: true` body flag plus
+    an `X-Trial-Ending: true` header, so clients can prompt an upgrade
+    before the user hits the 402 wall. Free tier only.
+    """
+    if row.get("tier") == "free" and remaining is not None and remaining <= 3:
+        return {"trial_ending": True}, {"X-Trial-Ending": "true"}
+    return {}, {}
 
 
 def _spend_credit(row, endpoint: str, ip: str | None, user_agent: str | None):
@@ -402,11 +426,11 @@ def caption_pack(
 
     pack["credits_used"] = 1
     pack["credits_remaining"] = remaining
-    return JSONResponse(
-        status_code=200,
-        content=pack,
-        headers={"X-Credits-Remaining": str(remaining)},
-    )
+    body_extra, header_extra = _trial_ending_extras(row, remaining)
+    pack.update(body_extra)
+    headers = {"X-Credits-Remaining": str(remaining)}
+    headers.update(header_extra)
+    return JSONResponse(status_code=200, content=pack, headers=headers)
 
 
 @app.get("/v1/balance")
@@ -472,6 +496,7 @@ def gen_passphrase(
     )
     if err:
         return err
+    body_extra, header_extra = _trial_ending_extras(row, remaining)
 
     return JSONResponse(
         status_code=200,
@@ -484,8 +509,9 @@ def gen_passphrase(
             "count": req.count,
             "credits_used": 1,
             "credits_remaining": remaining,
+            **body_extra,
         },
-        headers={"X-Credits-Remaining": str(remaining)},
+        headers={"X-Credits-Remaining": str(remaining), **header_extra},
     )
 
 
@@ -532,6 +558,7 @@ def json_fix(
     )
     if err:
         return err
+    body_extra, header_extra = _trial_ending_extras(row, remaining)
 
     return JSONResponse(
         status_code=200,
@@ -542,8 +569,9 @@ def json_fix(
             "errors": errors,
             "credits_used": 1,
             "credits_remaining": remaining,
+            **body_extra,
         },
-        headers={"X-Credits-Remaining": str(remaining)},
+        headers={"X-Credits-Remaining": str(remaining), **header_extra},
     )
 
 
@@ -1042,6 +1070,23 @@ def stats(authorization: str | None = Header(default=None)):
         " JOIN checkout_mints c ON c.ip = f.ip"
         " JOIN stripe_events s ON s.key_id = c.key_id AND s.credits_added > 0"
     ).fetchone()["n"]
+    # Checkout funnel (lever #5): /v1/checkout mints vs completed payments.
+    ck = con.execute(
+        "SELECT COUNT(*) AS n, COUNT(DISTINCT ip) AS ips FROM checkout_mints"
+    ).fetchone()
+    ck_24h = con.execute(
+        "SELECT COUNT(*) AS n FROM checkout_mints WHERE ts > ?",
+        (time.time() - 86400,),
+    ).fetchone()["n"]
+    paid = con.execute(
+        "SELECT COUNT(DISTINCT key_id) AS n FROM stripe_events"
+        " WHERE credits_added > 0"
+    ).fetchone()["n"]
+    paid_24h = con.execute(
+        "SELECT COUNT(DISTINCT key_id) AS n FROM stripe_events"
+        " WHERE credits_added > 0 AND ts > ?",
+        (time.time() - 86400,),
+    ).fetchone()["n"]
 
     con.close()
     return {
@@ -1060,6 +1105,13 @@ def stats(authorization: str | None = Header(default=None)):
         },
         "free_tier": {"mints_24h": free_mints_24h},
         "free_to_paid_conversion": {"converted_ips": converted},
+        "checkout_funnel": {
+            "mints_total": ck["n"],
+            "mints_unique_ips_total": ck["ips"],
+            "mints_24h": ck_24h,
+            "paid_keys_total": paid,
+            "paid_keys_24h": paid_24h,
+        },
     }
 
 

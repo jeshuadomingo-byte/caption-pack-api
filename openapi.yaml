@@ -31,7 +31,7 @@ info:
 
     ## Error envelope
     Every 4xx/5xx is `{"error": {"code": "...", "message": "..."}}`.
-    402s add `top_up_url`. Known codes: `invalid_params` (400),
+    402s add `checkout_url` (the /v1/checkout page). Known codes: `invalid_params` (400),
     `invalid_key` (401), `key_expired` (401), `insufficient_credits` (402),
     `out_of_credits` (402), `free_trial_exhausted` (402),
     `free_trial_limit` (429), `rate_limited` (429),
@@ -495,8 +495,10 @@ components:
           properties:
             code: { type: string, example: "invalid_key" }
             message: { type: string }
-            top_up_url: { type: string,
-                          description: "Present on 402s: the Stripe payment link." }
+            checkout_url: { type: string,
+                          description: "Present on 402s: the /v1/checkout page URL (mints a paid key; the raw Stripe link cannot credit anyone)." }
+            trial_ending: { type: boolean,
+                          description: "Present on 200s for free-trial keys with <=3 credits left: soft upgrade nudge before the 402 wall." }
   responses:
     BadRequest:
       description: Invalid parameters.
@@ -509,7 +511,7 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }
     PaymentRequired:
-      description: Out of credits. Envelope includes top_up_url.
+      description: Out of credits. Envelope includes checkout_url.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }

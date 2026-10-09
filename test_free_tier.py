@@ -185,7 +185,8 @@ def main() -> None:
     check("26th call -> 402", status_of(over) == 402)
     over_body = json.loads(over.body.decode())
     check("free-exhausted code", over_body["error"]["code"] == "free_trial_exhausted")
-    check("top_up_url present", "top_up_url" in over_body["error"])
+    check("checkout_url present", over_body["error"].get("checkout_url", "").endswith("/v1/checkout"))
+    check("top_up_url gone", "top_up_url" not in over_body["error"])
 
     # --- 5. free key expiry ---------------------------------------------------
     con = app._db()

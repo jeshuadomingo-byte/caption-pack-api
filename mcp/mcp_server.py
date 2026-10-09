@@ -222,6 +222,14 @@ if __name__ == "__main__":
         from starlette.middleware.cors import CORSMiddleware
 
         _app = server.streamable_http_app(stateless_http=True)
+
+        from starlette.responses import JSONResponse
+        from starlette.routing import Route
+
+        async def _health(_request):
+            return JSONResponse({"ok": True, "service": "caption-pack-mcp"})
+
+        _app.routes.append(Route("/health", _health))
         _app.add_middleware(_ApiKeyMiddleware)
         _app.add_middleware(
             CORSMiddleware,

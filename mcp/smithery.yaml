@@ -1,0 +1,19 @@
+# Smithery deployment configuration
+# https://smithery.ai/docs/build/project-config
+# Base directory for this server: mcp/
+
+runtime: "container"
+build:
+  dockerfile: "Dockerfile"
+  dockerBuildPath: "."
+startCommand:
+  type: "http"
+  configSchema:
+    type: object
+    required: [apiKey]
+    properties:
+      apiKey:
+        type: string
+        description: "Your Caption-Pack API key. Mint a free 25-call key (no card) or get $10/500 calls at https://caption-pack-api.onrender.com/v1/checkout"
+  exampleConfig:
+    apiKey: "cp_free_..."

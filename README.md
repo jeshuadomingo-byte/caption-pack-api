@@ -1,5 +1,7 @@
 # Caption-Pack API
 
+[![Featured on DevShelf](https://img.shields.io/badge/DevShelf-Verified_Free-7928CA?style=flat-square&logo=googlechrome&logoColor=white)](https://devshelf.ritualdev.in/tools/caption-pack-api.html)
+
 Working prototype of the metered caption-pack micro-SaaS
 (spec: `../caption-pack-api-spec.md`).
 **Live:** https://caption-pack-api.onrender.com ·

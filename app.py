@@ -380,7 +380,16 @@ class PackRequest(BaseModel):
     niche: str | None = None
 
 
-@app.post("/v1/caption-pack")
+@app.post(
+    "/v1/caption-pack",
+    summary="Generate social captions",
+    description=(
+        "Use when you need ready-to-post social captions: hooks, post bodies, "
+        "CTAs, and hashtags as JSON for LinkedIn, Instagram, TikTok, or X. "
+        "Deterministic template engine (no LLM) — best for on-brand, "
+        "repeatable captions. Costs 1 API credit per call."
+    ),
+)
 def caption_pack(
     req: PackRequest,
     authorization: str | None = Header(default=None),
@@ -463,7 +472,15 @@ class PassphraseRequest(BaseModel):
     count: int = Field(default=5, ge=1, le=20)
 
 
-@app.post("/v1/passphrase")
+@app.post(
+    "/v1/passphrase",
+    summary="Generate a passphrase",
+    description=(
+        "Use when you need a memorable, high-entropy passphrase (e.g. for a "
+        "password manager master password or Wi-Fi key). Deterministic word "
+        "generator — no LLM. Costs 1 API credit per call."
+    ),
+)
 def gen_passphrase(
     req: PassphraseRequest,
     authorization: str | None = Header(default=None),
@@ -531,7 +548,16 @@ class JsonFixRequest(BaseModel):
     indent: int = Field(default=2, ge=0, le=8)
 
 
-@app.post("/v1/json-fix")
+@app.post(
+    "/v1/json-fix",
+    summary="Repair broken JSON",
+    description=(
+        "Use when you have malformed JSON that a strict parser rejects "
+        "(trailing commas, missing quotes, stray comments) and need it "
+        "repaired deterministically. Returns fixed JSON or a clear error. "
+        "Costs 1 API credit per call."
+    ),
+)
 def json_fix(
     req: JsonFixRequest,
     authorization: str | None = Header(default=None),
@@ -621,9 +647,51 @@ def checkout(request: Request):
         return f"{base}{sep}client_reference_id={key_id}"
 
     pay_url = _pay_url(TOP_UP_URL)
-    pro_block = ""
+    # Pack echo: /v1/checkout?pack=starter|pro names the pack the buyer picked
+    # on the landing page. Unknown/missing pack keeps the old default page.
+    pack = request.query_params.get("pack", "").strip().lower()
+    pack_banner = ""
+    starter_cta = (
+        f'<a class="btn" href="{pay_url}">Continue to payment'
+        " — $10 for 500 credits</a>"
+    )
+    pro_cta = ""
     if TOP_UP_URL_PRO:
-        pro_block = f"""
+        pro_cta = (
+            f'<a class="btn" href="{_pay_url(TOP_UP_URL_PRO)}">Continue to payment'
+            " — $25 for 1,500 credits</a>"
+        )
+    if pack == "starter":
+        pack_banner = (
+            "<p style='font-size:18px'>You're buying the <b>Starter Pack</b>"
+            " — $10 for 500 calls (2&cent; per call).</p>"
+            "<p>One-time prepaid pack. Paid credits never expire."
+            " All sales final.</p>"
+        )
+        pro_block = ""
+        if TOP_UP_URL_PRO:
+            pro_block = f"""
+<p style="margin-top:28px">Need more? <b>Pro pack</b> \u2014 1,500 credits for $25
+(1.7&cent; per call).</p>
+<a class="btn" href="{_pay_url(TOP_UP_URL_PRO)}">Continue to payment \u2014 $25 for 1,500 credits</a>"""
+    elif pack == "pro":
+        pack_banner = (
+            "<p style='font-size:18px'>You're buying the <b>Pro Pack</b>"
+            " — $25 for 1,500 calls (~1.7&cent; per call). Best value.</p>"
+            "<p>One-time prepaid pack. Paid credits never expire."
+            " All sales final.</p>"
+        )
+        pro_block = ""
+        if pro_cta:
+            pro_block = f"""
+<p style="margin-top:28px">Just need the basics? <b>Starter pack</b>
+\u2014 500 credits for $10 (2&cent; per call).</p>
+{starter_cta}"""
+            starter_cta = pro_cta
+    else:
+        pro_block = ""
+        if TOP_UP_URL_PRO:
+            pro_block = f"""
 <p style="margin-top:28px">Need more? <b>Pro pack</b> \u2014 1,500 credits for $25
 (1.7&cent; per call).</p>
 <a class="btn" href="{_pay_url(TOP_UP_URL_PRO)}">Continue to payment \u2014 $25 for 1,500 credits</a>"""
@@ -644,12 +712,13 @@ padding:14px 32px;border-radius:10px;font-weight:600;margin-top:8px}}
 .warn{{color:#f5b54a;font-size:14px;margin-top:16px}}
 </style></head><body><div class="card">
 <h1>Your API key is ready</h1>
+{pack_banner}
 <p>Save this now — it's shown <b>once</b>. After payment, this same key gets
 credited automatically.</p>
 <div class="key">{raw_key}</div>
-<a class="btn" href="{pay_url}">Continue to payment — $10 for 500 credits</a>
+{starter_cta}
 {pro_block}
-<p class="warn">No refunds — all sales final. Credits never expire.</p>
+<p class="warn">No refunds — all sales final. Paid credits never expire.</p>
 </div></body></html>"""
     )
 

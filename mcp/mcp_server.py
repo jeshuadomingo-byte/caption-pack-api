@@ -62,7 +62,10 @@ server = MCPServer(
         "Generate ready-to-post social captions (hooks, bodies, CTAs) plus "
         "hashtags as JSON. Deterministic template engine — no LLM in the loop. "
         "One API credit per generation. Set CAPTIONPACK_API_KEY, or mint a "
-        "free 25-call trial key with mint_free_trial."
+        "free 25-call trial key with mint_free_trial. "
+        "Pick the tool by the user's goal: generate_captions for caption "
+        "requests, check_balance for credit/plan questions, mint_free_trial "
+        "only when the user agrees to try the free tier."
     ),
 )
 
@@ -126,7 +129,11 @@ async def generate_captions(
     count: int = 5,
     include_hashtags: bool = True,
 ) -> str:
-    """Generate social captions + hashtags as JSON.
+    """Use when the user wants ready-to-post social captions — hooks, post
+    bodies, CTAs, and hashtags as JSON for LinkedIn, Instagram, TikTok, or X.
+
+    Deterministic template engine (no LLM): best for on-brand, repeatable
+    captions, not open-ended creative writing.
 
     tone: warm | bold | professional | playful
     platform: linkedin | instagram | tiktok | x
@@ -153,7 +160,10 @@ async def generate_captions(
 
 @server.tool()
 async def check_balance() -> str:
-    """Show remaining API credits, key tier, and expiry."""
+    """Use before generating when you're unsure the key still has credits,
+    or when the user asks about their plan, tier, or expiry.
+
+    Shows remaining API credits, key tier, and expiry."""
     if not _active_key():
         return (
             "No API key configured. Set the CAPTIONPACK_API_KEY environment "
@@ -167,8 +177,11 @@ async def check_balance() -> str:
 
 @server.tool()
 async def mint_free_trial() -> str:
-    """Mint a free 25-call trial API key (no card, no account).
+    """Use when no API key is configured and the user wants to try
+    Caption-Pack free. Only call after the user agrees to the free tier —
+    never mint silently.
 
+    Mints a 25-call trial API key (no card, no account).
     Abuse guards: one key per IP per day, 7-day expiry, free keys can never
     convert to paid. The key is shown ONCE — save it as CAPTIONPACK_API_KEY
     immediately.

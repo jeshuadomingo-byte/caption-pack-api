@@ -251,7 +251,19 @@ if __name__ == "__main__":
         async def _health(_request):
             return JSONResponse({"ok": True, "service": "caption-pack-mcp"})
 
+        # Glama connector-ownership claim. Glama fetches
+        # /.well-known/glama.json from this origin and re-checks it, so this
+        # route must stay. The token is public by design (Glama's own wording).
+        _GLAMA_CLAIM = {
+            "$schema": "https://glama.ai/mcp/schemas/connector.json",
+            "claim": "glama_claim_PjB9qSYhVdvFcwnL0AuPz-6Mvfx8Dv7T",
+        }
+
+        async def _glama_claim(_request):
+            return JSONResponse(_GLAMA_CLAIM)
+
         _app.routes.append(Route("/health", _health))
+        _app.routes.append(Route("/.well-known/glama.json", _glama_claim))
         _app.add_middleware(_ApiKeyMiddleware)
         _app.add_middleware(
             CORSMiddleware,
